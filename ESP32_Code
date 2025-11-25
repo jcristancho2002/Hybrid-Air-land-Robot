@@ -1,0 +1,271 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// ============================================================
+// CONFIGURACIÓN PCA9685 (Servos)
+// ============================================================
+Adafruit_PWMServoDriver pca9685 = Adafruit_PWMServoDriver(0x40);
+
+#define SERVO_MIN 100
+#define SERVO_MAX 600
+#define NUM_SERVOS 10
+
+int angulosObjetivo[NUM_SERVOS] = {0, 85, 0, 80, 0, 80, 0, 0, 55, 0};
+int angulosActuales[NUM_SERVOS];
+
+// ============================================================
+// CONFIGURACIÓN L298N (Motores)
+// ============================================================
+#define ENA 25
+#define IN1 26
+#define IN2 27
+#define ENB 14
+#define IN3 12
+#define IN4 13
+
+// ============================================================
+// CONFIGURACIÓN Wi-Fi
+// ============================================================
+const char* ssid = "iPhone Juanjo";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// ============================================================
+// PÁGINA WEB DE CONTROL
+// ============================================================
+String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='utf-8'>
+  <title>Control Dron Híbrido</title>
+  <style>
+    body { font-family: Arial; text-align:center; background:#101820; color:#fff; }
+    h1 { color:#00aaff; }
+    button {
+      font-size:20px; padding:15px 30px; margin:10px;
+      border:none; border-radius:10px; background:#00aaff; color:white;
+      cursor:pointer;
+    }
+    button:hover { background:#0077cc; }
+    .stop { background:red; }
+  </style>
+</head>
+<body>
+  <h1>🚀 Dron Híbrido ESP32</h1>
+  <p>
+    <button onclick="send('HOME')">HOME 🏠</button>
+    <button onclick="send('START')">START 🚗</button>
+    <button onclick="send('FLY')">FLY ✈️</button>
+  </p>
+  <p>
+    <button onclick="send('W')">⬆️ Avanzar</button><br>
+    <button onclick="send('A')">⬅️ Izquierda</button>
+    <button onclick="send('S')">⬇️ Retroceder</button>
+    <button onclick="send('D')">➡️ Derecha</button>
+  </p>
+  <p><button class="stop" onclick="send('P')">⛔ Parar</button></p>
+  <script>
+    function send(cmd){ fetch('/cmd?c=' + cmd); }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// FUNCIONES SERVOS
+// ============================================================
+int anguloAPulso(int angulo) { return map(angulo, 0, 180, SERVO_MIN, SERVO_MAX); }
+
+void moverServo(int canal, int angulo) {
+  if (canal < 0 || canal >= NUM_SERVOS) return;
+  pca9685.setPWM(canal, 0, anguloAPulso(angulo));
+  angulosActuales[canal] = angulo;
+}
+
+void moverServoSuave(int canal, int destino, int pasos = 200, int delayPaso = 10) {
+  int inicio = angulosActuales[canal];
+  if (inicio < 0 || inicio > 180) inicio = destino;
+  int delta = destino - inicio;
+  for (int step = 0; step <= pasos; step++) {
+    int ang = inicio + delta * step / pasos;
+    moverServo(canal, ang);
+    delay(delayPaso);
+  }
+  angulosActuales[canal] = destino;
+}
+
+void moverDosServosSimultaneamente(int s1, int ang1, int s2, int ang2, int pasos = 200, int delayPaso = 10) {
+  int inicio1 = angulosActuales[s1];
+  int inicio2 = angulosActuales[s2];
+  if (inicio1 < 0 || inicio1 > 180) inicio1 = ang1;
+  if (inicio2 < 0 || inicio2 > 180) inicio2 = ang2;
+
+  for (int step = 0; step <= pasos; step++) {
+    int angA = inicio1 + (ang1 - inicio1) * step / pasos;
+    int angB = inicio2 + (ang2 - inicio2) * step / pasos;
+    moverServo(s1, angA);
+    moverServo(s2, angB);
+    delay(delayPaso);
+  }
+  angulosActuales[s1] = ang1;
+  angulosActuales[s2] = ang2;
+}
+
+// ============================================================
+// SECUENCIAS
+// ============================================================
+void buscarPosicionInicialSuave(int pasos = 250, int delayPaso = 10) {
+  Serial.println("🛫 MODO AÉREO: posición inicial de vuelo...");
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    int destino = angulosObjetivo[i];
+    int inicio = angulosActuales[i];
+    if (inicio < 0 || inicio > 180) inicio = destino;
+    for (int step = 0; step <= pasos; step++) {
+      int ang = inicio + (destino - inicio) * step / pasos;
+      moverServo(i, ang);
+      delay(delayPaso);
+    }
+  }
+  Serial.println("✅ En modo AÉREO (listo para volar).");
+}
+
+void ejecutarSecuenciaSuave() {
+  Serial.println("🚗 Transición a modo TERRESTRE...");
+
+  moverServoSuave(4, 70);
+  moverServoSuave(5, 20);
+  moverServoSuave(7, 50);
+  moverServoSuave(8, 5);
+  moverServoSuave(6, 50);
+  delay(800);
+
+  moverServoSuave(0, 80);
+  moverServoSuave(1, 0);
+  moverServoSuave(2, 80);
+  moverServoSuave(3, 0);
+  delay(800);
+
+  moverDosServosSimultaneamente(4, 0, 5, 85, 250, 10);
+  delay(500);
+
+  moverDosServosSimultaneamente(8, 50, 6, 0, 250, 10);
+  delay(800);
+
+  Serial.println("✅ Dron en modo TERRESTRE (listo para rodar).");
+}
+
+void volverAModoAereo() {
+  Serial.println("🛩️ Transición a modo AÉREO...");
+
+  moverDosServosSimultaneamente(8, 5, 6, 50, 250, 10);
+  delay(500);
+  moverDosServosSimultaneamente(4, 70, 5, 20, 250, 10);
+  delay(800);
+  moverServoSuave(0, 0);
+  moverServoSuave(1, 85);
+  moverServoSuave(2, 0);
+  moverServoSuave(3, 80);
+  delay(800);
+  moverServoSuave(4, 80);
+  moverServoSuave(5, 0);
+  moverServoSuave(6, 0);
+  moverServoSuave(7, 0);
+  moverServoSuave(8, 55);
+  delay(800);
+
+  Serial.println("✅ Dron de nuevo en modo AÉREO.");
+}
+
+// ============================================================
+// FUNCIONES MOTORES
+// ============================================================
+void iniciarMotores() {
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  detenerMotores();
+}
+
+void moverIzquierda(int v) {
+  v = constrain(v, -255, 255);
+  if (v > 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+  else if (v < 0) { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); }
+  else { digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); }
+  analogWrite(ENA, abs(v));
+}
+
+void moverDerecha(int v) {
+  v = constrain(v, -255, 255);
+  if (v > 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else if (v < 0) { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); }
+  else { digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); }
+  analogWrite(ENB, abs(v));
+}
+
+void detenerMotores() { moverIzquierda(0); moverDerecha(0); }
+void avanzar(int v=200){ moverIzquierda(-v); moverDerecha(-v); }
+void retroceder(int v=200){ moverIzquierda(v); moverDerecha(v); }
+void girarIzquierda(int v=200){ moverIzquierda(v); moverDerecha(-v); }
+void girarDerecha(int v=200){ moverIzquierda(-v); moverDerecha(v); }
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  pca9685.begin();
+  pca9685.setPWMFreq(50);
+  iniciarMotores();
+
+  for (int i = 0; i < NUM_SERVOS; i++) angulosActuales[i] = -1;
+
+  // Conexión Wi-Fi
+  Serial.println("🔌 Conectando a WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Conectado a WiFi.");
+  Serial.print("📶 IP del dron: ");
+  Serial.println(WiFi.localIP());
+
+  // Servidor web
+  server.on("/", []() { server.send(200, "text/html", htmlPage); });
+
+  server.on("/cmd", []() {
+    String c = server.arg("c");
+    Serial.println("🔹 Comando remoto: " + c);
+
+    if (c.equalsIgnoreCase("HOME")) buscarPosicionInicialSuave();
+    else if (c.equalsIgnoreCase("START")) ejecutarSecuenciaSuave();
+    else if (c.equalsIgnoreCase("FLY")) volverAModoAereo();
+    else if (c.equalsIgnoreCase("W")) avanzar(220);
+    else if (c.equalsIgnoreCase("S")) retroceder(220);
+    else if (c.equalsIgnoreCase("A")) girarIzquierda(220);
+    else if (c.equalsIgnoreCase("D")) girarDerecha(220);
+    else if (c.equalsIgnoreCase("P")) detenerMotores();
+
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+  Serial.println("🌐 Servidor Web iniciado.");
+  Serial.println("✅ Dron híbrido listo para control remoto.");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  server.handleClient();  // Escucha comandos web
+}
